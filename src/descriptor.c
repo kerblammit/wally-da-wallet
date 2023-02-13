@@ -18,6 +18,8 @@
 #define MS_FLAGS_ALL (WALLY_MINISCRIPT_TAPSCRIPT | \
         WALLY_MINISCRIPT_ONLY | \
         WALLY_MINISCRIPT_REQUIRE_CHECKSUM)
+#define MS_FLAGS_CANONICALIZE (WALLY_MINISCRIPT_REQUIRE_CHECKSUM | \
+        WALLY_MINISCRIPT_POLICY)
 
 /* Properties and expressions definition */
 #define TYPE_NONE  0x00
@@ -262,6 +264,7 @@ static const struct addr_ver_t *addr_ver_from_family(
 static const struct ms_builtin_t *builtin_get(const ms_node *node);
 static int generate_script(ms_ctx *ctx, ms_node *node,
                            unsigned char *script, size_t script_len, size_t *written);
+static bool is_valid_policy_map(const struct wally_map *map_in);
 
 /* Wrapper for strtoll */
 static bool strtoll_n(const char *str, size_t str_len, int64_t *v)
@@ -347,8 +350,10 @@ static int generate_checksum(const char *str, size_t str_len, char *checksum_out
     return WALLY_OK;
 }
 
-static inline bool is_identifer_char(char c)
+static inline bool is_identifer_char(char c, uint32_t flags)
 {
+    if (flags & WALLY_MINISCRIPT_POLICY)
+        return (c >= '0' && c <= '9') || c == '@';
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
 }
 
@@ -376,17 +381,20 @@ static int canonicalize(const char *descriptor,
     if (output)
         *output = NULL;
 
-    if (!descriptor || (flags & ~WALLY_MINISCRIPT_REQUIRE_CHECKSUM) || !output)
+    if (!descriptor || (flags & ~MS_FLAGS_CANONICALIZE) || !output)
         return WALLY_EINVAL;
+
+    if ((flags & WALLY_MINISCRIPT_POLICY) && !is_valid_policy_map(vars_in))
+        return WALLY_EINVAL; /* Invalid policy variables given */
 
     /* First, find the length of the canonicalized descriptor */
     while (*p && *p != '#') {
-        while (*p && *p != '#' && !is_identifer_char(*p)) {
+        while (*p && *p != '#' && !is_identifer_char(*p, flags)) {
             ++required_len;
             ++p;
         }
         start = p;
-        while (is_identifer_char(*p))
+        while (is_identifer_char(*p, flags))
             ++p;
         if (p != start) {
             const bool starts_with_digit = *start >= '0' && *start <= '9';
@@ -410,18 +418,18 @@ static int canonicalize(const char *descriptor,
     p = descriptor;
     out = *output;
     while (*p && *p != '#') {
-        while (*p && *p != '#' && !is_identifer_char(*p)) {
+        while (*p && *p != '#' && !is_identifer_char(*p, flags)) {
             *out++ = *p++;
         }
         start = p;
-        while (is_identifer_char(*p))
+        while (is_identifer_char(*p, flags))
             ++p;
         if (p != start) {
             const bool is_number = *start >= '0' && *start <= '9';
             size_t lookup_len = p - start;
-            if (!vars_in || lookup_len > VAR_MAX_NAME_LEN || is_number) {
+            if (!vars_in || lookup_len > VAR_MAX_NAME_LEN || is_number)
                 memcpy(out, start, lookup_len);
-            } else {
+            else {
                 /* Lookup the potential identifier */
                 const struct wally_map_item *item = lookup_identifier(vars_in, start, lookup_len);
                 lookup_len = item ? item->value_len - 1 : lookup_len;
@@ -2370,6 +2378,35 @@ static int node_generate_script(ms_ctx *ctx, uint32_t depth, uint32_t index,
     return ret;
 }
 
+static bool is_valid_policy_map(const struct wally_map *map_in)
+{
+    ms_ctx ctx;
+    ms_node* node;
+    int64_t v;
+    size_t i;
+    int ret = WALLY_OK;
+
+    memset(&ctx, 0, sizeof(ctx));
+
+    for (i = 0; ret == WALLY_OK && i < map_in->num_items; ++i) {
+        const struct wally_map_item *item = &map_in->items[i];
+        if (!item->key || item->key_len < 2 || item->key[0] != '@' ||
+            !strtoll_n((const char *)item->key + 1, item->key_len - 1, &v) || v < 0)
+            return false; /* Policy keys can only be @n */
+        if (!item->value || !item->value_len)
+            return false; /* No key value */
+        if (!(node = wally_calloc(sizeof(*node))))
+            return false;
+        node->data = (const char*)item->value;
+        node->data_len = item->value_len - 1;
+        if (analyze_miniscript_key(&ctx, 0, node, NULL) != WALLY_OK ||
+            node->kind == KIND_PRIVATE_KEY)
+            ret = WALLY_EINVAL; /* Policy data must be an xpub */
+        node_free(node);
+    }
+    return ret == WALLY_OK;
+}
+
 int wally_descriptor_parse(const char *miniscript,
                            const struct wally_map *vars_in,
                            uint32_t network, uint32_t flags,
@@ -2391,8 +2428,7 @@ int wally_descriptor_parse(const char *miniscript,
         return WALLY_ENOMEM;
     ctx = *output;
     ctx->addr_ver = addr_ver;
-    ret = canonicalize(miniscript, vars_in,
-                       flags & WALLY_MINISCRIPT_REQUIRE_CHECKSUM,
+    ret = canonicalize(miniscript, vars_in, flags & MS_FLAGS_CANONICALIZE,
                        &ctx->src);
     if (ret == WALLY_OK) {
         ctx->src_len = strlen(ctx->src);
