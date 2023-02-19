@@ -1,5 +1,10 @@
 # Changes
 
+## Version 0.8.9
+ - descriptor_get_num_variants: Now returns 1 instead of 0 if no variants are
+   present. This allows iterating the variant from 0 to the number of variants
+   returned in order to generate all scripts/addresses.
+
 ## Version 0.8.8
 - witness_multisig_from_bytes: The length for the internally generated
   scriptsig was not calculated correctly, and not checked after generation.
